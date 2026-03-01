@@ -1,5 +1,7 @@
 import multiprocessing
 import queue
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Optional, Dict, List
 def _run_download_task(args: List[str], event_queue) -> None:
     try:
         from app.core.download_script import run_download_task
+
         run_download_task(args, event_queue)
     except Exception as exc:
         try:
@@ -28,11 +31,12 @@ class DownloadService:
         self._models_dir = models_dir
 
         self._lock = threading.Lock()
-        self._process: Optional[multiprocessing.Process] = None
+        self._process: Optional[subprocess.Popen] = None
         self._ipc_queue: Optional[object] = None
         self._queue: Optional[queue.Queue] = None
         self._reader: Optional[threading.Thread] = None
         self._running = False
+        self._is_subprocess: bool = False
         self._status: Dict[str, object] = {
             "running": False,
             "repo_id": "",
@@ -74,17 +78,47 @@ class DownloadService:
                     if (models_root / name).exists():
                         raise RuntimeError(f"模型已存在: {name}")
 
-            ctx = multiprocessing.get_context("spawn")
-            self._ipc_queue = ctx.Queue()
+            # 检测是否在 PyInstaller 打包环境中
+            is_frozen = getattr(sys, "frozen", False)
             self._queue = queue.Queue()
-            self._process = ctx.Process(
-                target=_run_download_task,
-                args=([repo_id, self._cache_dir, self._models_dir], self._ipc_queue),
-                daemon=True,
-            )
-            self._process.start()
+
+            if is_frozen:
+                # 打包环境：使用 subprocess 启动 EXE 配合 --download-script 参数
+                self._is_subprocess = True
+                args = [
+                    sys.executable,
+                    "--download-script",
+                    repo_id,
+                    self._cache_dir,
+                    self._models_dir,
+                ]
+                self._process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                )
+                self._reader = threading.Thread(
+                    target=self._read_subprocess_output, daemon=True
+                )
+            else:
+                # 开发环境：使用 multiprocessing.Process 直接调用函数
+                self._is_subprocess = False
+                ctx = multiprocessing.get_context("spawn")
+                self._ipc_queue = ctx.Queue()
+                self._process = ctx.Process(
+                    target=_run_download_task,
+                    args=(
+                        [repo_id, self._cache_dir, self._models_dir],
+                        self._ipc_queue,
+                    ),
+                    daemon=True,
+                )
+                self._process.start()
+                self._reader = threading.Thread(target=self._read_loop, daemon=True)
+
             self._running = True
-            self._reader = threading.Thread(target=self._read_loop, daemon=True)
             self._reader.start()
             self._status = {
                 "running": True,
@@ -104,12 +138,23 @@ class DownloadService:
         with self._lock:
             process = self._process
             ipc_queue = self._ipc_queue
+            is_subprocess = self._is_subprocess
             if not process:
                 return
             try:
-                if process.is_alive():
+                if is_subprocess:
+                    # subprocess.Popen
                     process.terminate()
-                    process.join(timeout=1)
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1)
+                else:
+                    # multiprocessing.Process
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=1)
             finally:
                 self._running = False
                 self._status["running"] = False
@@ -179,6 +224,70 @@ class DownloadService:
                 error = f"Download exited with code {exit_code}"
                 self._update_status(error=error, message="")
                 self._queue.put({"type": "error", "message": error})
+            self._queue.put({"type": "done"})
+
+        with self._lock:
+            self._running = False
+            self._status["running"] = False
+            self._status["updated_at"] = time.time()
+
+    def _read_subprocess_output(self) -> None:
+        """读取打包环境下子进程的 stdout 输出（@PROGRESS@file@percent 格式）"""
+        assert self._process is not None
+        assert self._queue is not None
+
+        done = False
+        while True:
+            try:
+                line = self._process.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+
+                # 解析子进程输出的事件格式
+                if line.startswith("@PROGRESS@"):
+                    parts = line.split("@", 4)
+                    if len(parts) >= 4:
+                        file_name = parts[2]
+                        try:
+                            percent = int(parts[3])
+                        except ValueError:
+                            percent = 0
+                        self._update_status(percent=percent, file=file_name, message="")
+                        self._queue.put(
+                            {"type": "progress", "file": file_name, "percent": percent}
+                        )
+                elif line.startswith("@LOG@"):
+                    message = line.split("@", 2)[-1]
+                    self._update_status(message=message)
+                    self._queue.put({"type": "log", "message": message})
+                elif line.startswith("@FINISHED@"):
+                    path = line.split("@", 2)[-1]
+                    self._update_status(path=path)
+                    self._queue.put({"type": "finished", "path": path})
+                elif line.startswith("@ERROR@"):
+                    message = line.split("@", 2)[-1]
+                    self._update_status(error=message, message="")
+                    self._queue.put({"type": "error", "message": message})
+                    done = True
+                    break
+            except Exception:
+                break
+
+        # 等待子进程结束
+        try:
+            exit_code = self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            exit_code = -1
+
+        if exit_code not in (0, None):
+            error = f"Download exited with code {exit_code}"
+            self._update_status(error=error, message="")
+            self._queue.put({"type": "error", "message": error})
+
+        if not done:
             self._queue.put({"type": "done"})
 
         with self._lock:
