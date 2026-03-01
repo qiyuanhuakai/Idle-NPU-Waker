@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 
 
 def _run_download_task(args: List[str], event_queue) -> None:
@@ -31,7 +31,7 @@ class DownloadService:
         self._models_dir = models_dir
 
         self._lock = threading.Lock()
-        self._process: Optional[subprocess.Popen] = None
+        self._process: Optional[Union[subprocess.Popen, multiprocessing.Process]] = None
         self._ipc_queue: Optional[object] = None
         self._queue: Optional[queue.Queue] = None
         self._reader: Optional[threading.Thread] = None
@@ -137,7 +137,6 @@ class DownloadService:
     def stop(self) -> None:
         with self._lock:
             process = self._process
-            ipc_queue = self._ipc_queue
             is_subprocess = self._is_subprocess
             if not process:
                 return
@@ -161,13 +160,12 @@ class DownloadService:
                 self._status["message"] = "cancelled"
                 self._status["updated_at"] = time.time()
 
-        if ipc_queue is not None:
+
+        # 统一向队列推送取消/完成事件，确保 UI 能收到通知
+        if self._queue is not None:
             try:
-                ipc_queue.put({"type": "cancelled"})
-            except Exception:
-                pass
-            try:
-                ipc_queue.put({"type": "done"})
+                self._queue.put({"type": "cancelled"})
+                self._queue.put({"type": "done"})
             except Exception:
                 pass
 
@@ -248,17 +246,17 @@ class DownloadService:
 
                 # 解析子进程输出的事件格式
                 if line.startswith("@PROGRESS@"):
-                    parts = line.split("@", 4)
-                    if len(parts) >= 4:
-                        file_name = parts[2]
+                    payload = line[len("@PROGRESS@"):]
+                    file_name = payload
+                    percent = 0
+                    if "@" in payload:
+                        file_name, percent_str = payload.rsplit("@", 1)
                         try:
-                            percent = int(parts[3])
+                            percent = int(percent_str)
                         except ValueError:
                             percent = 0
-                        self._update_status(percent=percent, file=file_name, message="")
-                        self._queue.put(
-                            {"type": "progress", "file": file_name, "percent": percent}
-                        )
+                    self._update_status(percent=percent, file=file_name, message="")
+                    self._queue.put({"type": "progress", "file": file_name, "percent": percent})
                 elif line.startswith("@LOG@"):
                     message = line.split("@", 2)[-1]
                     self._update_status(message=message)
@@ -267,10 +265,14 @@ class DownloadService:
                     path = line.split("@", 2)[-1]
                     self._update_status(path=path)
                     self._queue.put({"type": "finished", "path": path})
+                    self._queue.put({"type": "done"})
+                    done = True
+                    break
                 elif line.startswith("@ERROR@"):
                     message = line.split("@", 2)[-1]
                     self._update_status(error=message, message="")
                     self._queue.put({"type": "error", "message": message})
+                    self._queue.put({"type": "done"})
                     done = True
                     break
             except Exception:
@@ -286,9 +288,9 @@ class DownloadService:
             error = f"Download exited with code {exit_code}"
             self._update_status(error=error, message="")
             self._queue.put({"type": "error", "message": error})
-
-        if not done:
             self._queue.put({"type": "done"})
+
+        # 向队列推送取消/完成事件，确保 UI 能收到通知
 
         with self._lock:
             self._running = False
